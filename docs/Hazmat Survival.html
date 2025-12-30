@@ -1,0 +1,941 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>3D Shooter Demo - Upgrades Keyboard/Mouse</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<style>
+html,body{height:100%;margin:0;overflow:hidden;background:#87ceeb}
+#overlay{
+    position:fixed;left:10px;top:10px;color:#fff;font-family:sans-serif;
+    background:rgba(0,0,0,0.4);padding:8px;border-radius:6px;z-index:2;
+}
+#upgradeMenu{
+    position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);
+    background:rgba(0,0,0,0.8);padding:20px;border-radius:10px;color:#fff;font-family:sans-serif;display:none;
+    z-index:3;text-align:center;
+}
+#upgradeMenu button{
+    display:block;margin:10px auto;padding:10px 20px;font-size:16px;border-radius:6px;border:0;background:#1e90ff;color:#fff;cursor:pointer;
+}
+#blocker{
+    position:fixed;inset:0;display:flex;align-items:center;justify-content:center;
+    background:rgba(0,0,0,0.6);z-index:4;
+}
+canvas{display:block}
+</style>
+</head>
+<body>
+<div id="overlay">
+    Health: <span id="health">100</span> &nbsp; Score: <span id="score">0</span> &nbsp; Wave: <span id="wave">1</span><br/>
+    W/A/S/D to move • Mouse to rotate character • Click to shoot
+</div>
+<div id="upgradeMenu">
+    <div>Choose an upgrade:</div>
+    <button id="upgrade1"></button>
+    <button id="upgrade2"></button>
+    <button id="upgrade3"></button>
+</div>
+<div id="blocker"><button id="startBtn">Click to Start</button></div>
+
+<!-- Error overlay (captures uncaught errors and console.error) -->
+<div id="errorOverlay" style="position:fixed;left:10px;bottom:10px;right:10px;max-height:40%;overflow:auto;background:rgba(0,0,0,0.85);color:#fff;padding:8px;border-radius:6px;font-family:sans-serif;display:none;z-index:5;white-space:pre-wrap;font-size:12px;"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/three@0.158.0/build/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.158.0/examples/js/loaders/MTLLoader.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.158.0/examples/js/loaders/OBJLoader.js"></script> 
+
+<script>
+// Scene setup
+const scene = new THREE.Scene();
+scene.fog = new THREE.FogExp2(0x87ceeb, 0.001);
+const renderer = new THREE.WebGLRenderer({antialias:true});
+renderer.setSize(innerWidth, innerHeight);
+renderer.setClearColor(0x87ceeb);
+document.body.appendChild(renderer.domElement);
+
+// Lights
+const hemi = new THREE.HemisphereLight(0xffffff, 0x444444, 0.8); hemi.position.set(0,200,0); scene.add(hemi);
+const dir = new THREE.DirectionalLight(0xffffff, 0.6); dir.position.set(-100,100,-50); scene.add(dir);
+
+// Map
+const MAP_SIZE = 100;
+
+// Ground
+const groundMat = new THREE.MeshStandardMaterial({color:0x3c9b3c});
+const groundGeo = new THREE.PlaneGeometry(MAP_SIZE, MAP_SIZE);
+const ground = new THREE.Mesh(groundGeo, groundMat);
+ground.rotation.x = -Math.PI/2; ground.receiveShadow = true; scene.add(ground);
+
+// City Borders
+const borderMat = new THREE.MeshStandardMaterial({color:0x555555});
+const buildingSize = 4;
+const borderBuildings = [];
+function createBorderBuildings(){
+    borderBuildings.forEach(b=>scene.remove(b));
+    borderBuildings.length = 0;
+    for(let x=-MAP_SIZE/2;x<=MAP_SIZE/2;x+=buildingSize){
+        let front = new THREE.Mesh(new THREE.BoxGeometry(buildingSize, Math.random()*10+5, buildingSize), borderMat);
+        front.position.set(x, front.geometry.parameters.height/2, -MAP_SIZE/2 + buildingSize/2);
+        scene.add(front); borderBuildings.push(front);
+        let back = new THREE.Mesh(new THREE.BoxGeometry(buildingSize, Math.random()*10+5, buildingSize), borderMat);
+        back.position.set(x, back.geometry.parameters.height/2, MAP_SIZE/2 - buildingSize/2);
+        scene.add(back); borderBuildings.push(back);
+    }
+    for(let z=-MAP_SIZE/2;z<=MAP_SIZE/2;z+=buildingSize){
+        let left = new THREE.Mesh(new THREE.BoxGeometry(buildingSize, Math.random()*10+5, buildingSize), borderMat);
+        left.position.set(-MAP_SIZE/2 + buildingSize/2, left.geometry.parameters.height/2, z);
+        scene.add(left); borderBuildings.push(left);
+        let right = new THREE.Mesh(new THREE.BoxGeometry(buildingSize, Math.random()*10+5, buildingSize), borderMat);
+        right.position.set(MAP_SIZE/2 - buildingSize/2, right.geometry.parameters.height/2, z);
+        scene.add(right); borderBuildings.push(right);
+    }
+}
+createBorderBuildings();
+
+// Player (Object3D container)
+const player = new THREE.Object3D();
+player.position.set(0,1.0,0);
+scene.add(player);
+
+// Placeholder capsule while model loads (used for collisions/visuals)
+const placeholderMat = new THREE.MeshStandardMaterial({color:0x0000ff, transparent:true, opacity:0.7});
+const placeholderGeo = new THREE.CapsuleGeometry(0.5, 1.0, 4, 8);
+const playerPlaceholder = new THREE.Mesh(placeholderGeo, placeholderMat);
+playerPlaceholder.position.set(0,1.0,0);
+player.add(playerPlaceholder);
+
+// Player model (OBJ + MTL) with diagnostics, safe checks and dynamic loader fallback
+let playerModel = null;
+
+// Helper to set up the loaded OBJ
+function finalizePlayerModel(obj){
+    obj.traverse(function(n){ if(n.isMesh){ n.castShadow = true; n.receiveShadow = true; }});
+    // Adjusted scale/position so the model fits the player height
+    obj.scale.set(0.025, 0.025, 0.025);
+    obj.rotation.y = Math.PI;
+    obj.rotation.x = Math.PI*90/180;
+    obj.position.set(-2, -0.9, 0);
+    player.add(obj);
+    playerModel = obj;
+    // Remove placeholder when model loaded
+    if(player.children.includes(playerPlaceholder)) player.remove(playerPlaceholder);
+
+    // compute player height and store
+    const pbox = new THREE.Box3().setFromObject(playerModel);
+    const psize = pbox.getSize(new THREE.Vector3());
+    playerModel.userData = playerModel.userData || {};
+    playerModel.userData.height = psize.y;
+    // compute collider radius (use X/Z extents)
+    const pradius = Math.max(psize.x, psize.z) / 2;
+    playerModel.userData.colliderRadius = pradius;
+    PLAYER_RADIUS = pradius;
+    console.log('Player model added to scene (height=', psize.y, ', radius=', pradius, ')');
+
+    // Resize existing enemies to match player's height (but keep enemy model identity)
+    try{
+        for(let i = enemies.length - 1; i >= 0; i--){
+            const e = enemies[i];
+            const pos = e.position.clone();
+            const hp = e.userData && e.userData.hp ? e.userData.hp : (e.userData||{}).hp;
+
+            // If we have an enemy model prefab, replace with it scaled to player's height
+            if(enemyModelLoaded && enemyModelPrefab){
+                scene.remove(e); enemies.splice(i,1);
+                const newE = createEnemyFromModel(enemyModelPrefab, pos, hp, playerModel.userData.height);
+                scene.add(newE); enemies.push(newE);
+                continue;
+            }
+
+            // If it's a box placeholder, scale it to match player's height
+            if(e.geometry && e.geometry.type && e.geometry.type === 'BoxGeometry'){
+                const defaultBoxHeight = 3; // original box height
+                const scaleY = playerModel.userData.height / defaultBoxHeight;
+                e.scale.set(1, scaleY, 1);
+                e.position.y = player.position.y; // keep center aligned with player
+                continue;
+            }
+
+            // If it's a group/prefab, scale it to match player's height
+            if(e.type === 'Group'){
+                // try to read stored raw height
+                const raw = e.userData && e.userData.height ? e.userData.height : (()=>{ const b = new THREE.Box3().setFromObject(e); return b.getSize(new THREE.Vector3()).y; })();
+                if(raw > 0){ const factor = playerModel.userData.height / raw; e.scale.multiplyScalar(factor); e.position.y = player.position.y; }
+            }
+        }
+    }catch(err){ console.warn('Failed to resize existing enemies to player height', err); }
+}
+
+const OBJ_SCRIPT = 'https://cdn.jsdelivr.net/npm/three@0.158.0/examples/js/loaders/OBJLoader.js';
+const MTL_SCRIPT = 'https://cdn.jsdelivr.net/npm/three@0.158.0/examples/js/loaders/MTLLoader.js';
+
+function ensureScriptLoaded(url, checkFn, cb){
+    if(checkFn()) return cb();
+    const s = document.createElement('script'); s.src = url;
+    s.onload = ()=>{ console.log('Loaded script', url); setTimeout(()=>{ if(checkFn()) cb(); else console.warn(url+' loaded but check failed'); }, 10); };
+    s.onerror = ()=>{ 
+        console.error('Failed to load script', url); 
+        // Visual cue something went wrong
+        playerPlaceholder.material.color.setHex(0xff0000);
+        // Immediately fall back to fetch+parse so model still attempts to load
+        console.log('Loader script failed, falling back to fetch+parse loader:', url);
+        try { fetchOBJAndParse(); } catch(e){ console.error('Fallback fetchOBJAndParse threw', e); }
+    };
+    document.head.appendChild(s);
+}
+
+function hasOBJLoader(){ return (typeof THREE !== 'undefined' && typeof THREE.OBJLoader !== 'undefined') || (typeof OBJLoader !== 'undefined'); }
+function hasMTLLoader(){ return (typeof THREE !== 'undefined' && typeof THREE.MTLLoader !== 'undefined') || (typeof MTLLoader !== 'undefined'); }
+
+function parseMTL(text){
+    const lines = text.split('\n');
+    const materials = {};
+    let current = null;
+    for(let raw of lines){
+        const line = raw.trim(); if(!line || line.startsWith('#')) continue;
+        const parts = line.split(/\s+/);
+        const key = parts[0];
+        if(key === 'newmtl'){ current = parts[1]; materials[current] = { name: current, Kd: [0.8,0.8,0.8] }; }
+        else if(!current) continue;
+        else if(key === 'Kd'){ materials[current].Kd = [parseFloat(parts[1])||0, parseFloat(parts[2])||0, parseFloat(parts[3])||0]; }
+        else if(key === 'd' || key === 'Tr'){ materials[current].d = parseFloat(parts[1])||1.0; }
+    }
+    return materials;
+}
+
+function parseOBJ(text, materialsMap){
+    // OBJ parser: supports v, vn, vt, f, usemtl (groups faces by material)
+    const lines = text.split('\n');
+    const positions = [[0,0,0]]; // 1-based; pad index 0
+    const normals = [[0,0,0]];
+    const uvs = [[0,0]];
+    const groups = {}; // materialName -> array of vertex objects
+    let currentMat = 'default'; groups[currentMat] = [];
+
+    for(let raw of lines){
+        const line = raw.trim(); if(!line || line.startsWith('#')) continue;
+        const parts = line.split(/\s+/);
+        const key = parts[0];
+        if(key === 'v') positions.push([parseFloat(parts[1]), parseFloat(parts[2]), parseFloat(parts[3])]);
+        else if(key === 'vn') normals.push([parseFloat(parts[1]), parseFloat(parts[2]), parseFloat(parts[3])]);
+        else if(key === 'vt') uvs.push([parseFloat(parts[1]) || 0, parseFloat(parts[2]) || 0]);
+        else if(key === 'usemtl'){ currentMat = parts[1] || 'default'; if(!groups[currentMat]) groups[currentMat]=[]; }
+        else if(key === 'f'){
+            const verts = parts.slice(1).map(p=>{ const comps = p.split('/'); return { v: parseInt(comps[0],10), vt: comps[1] ? (comps[1].length?parseInt(comps[1],10):0) : 0, vn: comps[2] ? (comps[2].length?parseInt(comps[2],10):0) : 0 }; });
+            for(let i=1;i<verts.length-1;i++){ groups[currentMat].push(verts[0]); groups[currentMat].push(verts[i]); groups[currentMat].push(verts[i+1]); }
+        }
+    }
+
+    const root = new THREE.Group(); let any = false;
+    for(const matName in groups){ const vertexData = groups[matName]; if(vertexData.length===0) continue; any = true;
+        const positionsArr=[]; const normalsArr=[]; const uvsArr=[];
+        for(const v of vertexData){ const pi = v.v < 0 ? positions.length + v.v : v.v; const p = positions[pi]; positionsArr.push(p[0], p[1], p[2]);
+            if(v.vn){ const ni = v.vn < 0 ? normals.length + v.vn : v.vn; const n = normals[ni]; normalsArr.push(n[0], n[1], n[2]); }
+            if(v.vt){ const ti = v.vt < 0 ? uvs.length + v.vt : v.vt; const uv = uvs[ti]; uvsArr.push(uv[0], 1 - (uv[1]||0)); }
+        }
+        const geom = new THREE.BufferGeometry(); geom.setAttribute('position', new THREE.Float32BufferAttribute(positionsArr,3));
+        if(normalsArr.length>0) geom.setAttribute('normal', new THREE.Float32BufferAttribute(normalsArr,3));
+        if(uvsArr.length>0) geom.setAttribute('uv', new THREE.Float32BufferAttribute(uvsArr,2));
+        else geom.computeVertexNormals();
+
+        let colorHex = 0x888888; if(materialsMap && materialsMap[matName] && materialsMap[matName].Kd){ const kd = materialsMap[matName].Kd; colorHex = ((1<<24) + (Math.round(kd[0]*255)<<16) + (Math.round(kd[1]*255)<<8) + Math.round(kd[2]*255)) & 0xFFFFFF; }
+        const mat = new THREE.MeshStandardMaterial({color: colorHex});
+        const mesh = new THREE.Mesh(geom, mat); mesh.castShadow = true; mesh.receiveShadow = true; root.add(mesh);
+    }
+
+    if(!any) return null; return root;
+}
+
+function fetchOBJAndParse(){
+    const objUrl = encodeURI('Player Model/Hazmat Operative.obj');
+    const mtlUrl = encodeURI('Player Model/obj.mtl');
+    console.log('Fetching MTL then OBJ via fetch as fallback:', mtlUrl, objUrl);
+
+    fetch(mtlUrl)
+        .then(r => { if(!r.ok) throw new Error('MTL HTTP ' + r.status); return r.text(); })
+        .then(mtlText => {
+            const materialsMap = parseMTL(mtlText);
+            return fetch(objUrl)
+                .then(r => { if(!r.ok) throw new Error('OBJ HTTP ' + r.status); return r.text(); })
+                .then(objText => {
+                    const m = parseOBJ(objText, materialsMap);
+                    if (m) {
+                        finalizePlayerModel(m);
+                        console.log('OBJ parsed via fallback with MTL');
+                    } else {
+                        console.error('Parsed OBJ produced no geometry');
+                        playerPlaceholder.material.color.setHex(0xff0000);
+                    }
+                });
+        })
+        .catch(err => {
+            console.error('fetch/parse OBJ+MTL failed', err);
+            console.log('Attempting OBJ-only fetch+parse');
+            fetch(objUrl)
+                .then(r => { if(!r.ok) throw new Error('OBJ HTTP ' + r.status); return r.text(); })
+                .then(objText => {
+                    const m = parseOBJ(objText, null);
+                    if (m) {
+                        finalizePlayerModel(m);
+                        console.log('OBJ parsed via fallback (no MTL)');
+                    } else {
+                        console.error('Parsed OBJ produced no geometry');
+                        playerPlaceholder.material.color.setHex(0xff0000);
+                    }
+                })
+                .catch(e => {
+                    console.error('fetch/parse failed totally', e);
+                    playerPlaceholder.material.color.setHex(0xff0000);
+                });
+        });
+}
+
+
+function loadObjDirect(){
+    if(!hasOBJLoader()){ console.log('OBJLoader missing — trying to load dynamically'); ensureScriptLoaded(OBJ_SCRIPT, hasOBJLoader, loadObjDirect); return; }
+    try {
+        console.log('Attempting OBJ-only load...');
+        const OBJCls = (typeof THREE !== 'undefined' && typeof THREE.OBJLoader !== 'undefined') ? THREE.OBJLoader : (typeof OBJLoader !== 'undefined' ? OBJLoader : null);
+        if(!OBJCls){ console.error('OBJ loader class not available after script load — falling back to fetch+parse'); fetchOBJAndParse(); return; }
+        const objLoader = new OBJCls();
+        objLoader.load(encodeURI('Hazmat Operative.obj'), function(obj){ finalizePlayerModel(obj); }, function(xhr){ if(xhr && xhr.loaded && xhr.total) console.log('OBJ load progress', (xhr.loaded/xhr.total*100).toFixed(1)+'%'); }, function(err){ console.error('OBJ-only load failed', err); console.log('Falling back to fetch+parse'); fetchOBJAndParse(); });
+    } catch(e){ console.error('OBJ-only load threw', e); console.log('Falling back to fetch+parse'); fetchOBJAndParse(); }
+}
+
+// Try MTL+OBJ first, with clear logs; on failure, fallback to OBJ-only
+function loadWithMTL(){
+    if(!hasMTLLoader()){ console.log('MTLLoader missing — trying to load dynamically'); ensureScriptLoaded(MTL_SCRIPT, hasMTLLoader, loadWithMTL); return; }
+    if(!hasOBJLoader()){ console.log('OBJLoader missing — trying to load dynamically'); ensureScriptLoaded(OBJ_SCRIPT, hasOBJLoader, loadWithMTL); return; }
+
+    console.log('MTL/OBJ loaders available — loading MTL then OBJ');
+    const MTLCls = (typeof THREE !== 'undefined' && typeof THREE.MTLLoader !== 'undefined') ? THREE.MTLLoader : (typeof MTLLoader !== 'undefined' ? MTLLoader : null);
+    const OBJCls = (typeof THREE !== 'undefined' && typeof THREE.OBJLoader !== 'undefined') ? THREE.OBJLoader : (typeof OBJLoader !== 'undefined' ? OBJLoader : null);
+    if(!MTLCls || !OBJCls){ console.warn('Loader classes not available after attempts, falling back to OBJ-only'); loadObjDirect(); return; }
+
+    const mtlLoader = new MTLCls();
+    mtlLoader.load(encodeURI('obj.mtl'), function(materialCreator){
+        console.log('MTL loaded');
+        materialCreator.preload();
+        const objLoader = new OBJCls();
+        objLoader.setMaterials(materialCreator);
+        objLoader.load(encodeURI('Hazmat Operative.obj'), function(obj){ console.log('OBJ loaded with materials'); finalizePlayerModel(obj); }, function(xhr){ if(xhr && xhr.loaded && xhr.total) console.log('OBJ with MTL progress', (xhr.loaded/xhr.total*100).toFixed(1)+'%'); }, function(err){ console.warn('Failed to load player OBJ with MTL, will try OBJ-only', err); loadObjDirect(); });
+    }, function(xhr){ if(xhr && xhr.loaded && xhr.total) console.log('MTL load progress', (xhr.loaded/xhr.total*100).toFixed(1)+'%'); }, function(err){ console.warn('Failed to load player MTL, trying OBJ-only', err); loadObjDirect(); });
+}
+
+loadWithMTL();
+// Start loading enemy model in background
+fetchEnemyModel();
+
+// Camera
+const camera = new THREE.PerspectiveCamera(75, innerWidth/innerHeight, 0.1, 1000);
+let camDistance = 6, camHeight = 4.0; // increased for higher third-person view
+let yaw = 0;
+
+// Movement
+const move={forward:false,back:false,left:false,right:false};
+// Player movement speed is defined relative to enemy speed: player = enemyBaseSpeed * playerEnemySpeedFactor
+let playerEnemySpeedFactor = 1.25; // player moves 25% faster than enemies by default (can be upgraded)
+document.addEventListener('keydown', e=>{
+    if(e.code==='KeyW') move.forward=true;
+    if(e.code==='KeyS') move.back=true;
+    if(e.code==='KeyA') move.left=true;
+    if(e.code==='KeyD') move.right=true;
+    if(e.code==='KeyP'){
+        // secret: spawn a drone near the player
+        if(typeof spawnDroneAt === 'function') spawnDroneAt(player.position.clone());
+    }
+});
+document.addEventListener('keyup', e=>{
+    if(e.code==='KeyW') move.forward=false;
+    if(e.code==='KeyS') move.back=false;
+    if(e.code==='KeyA') move.left=false;
+    if(e.code==='KeyD') move.right=false;
+});
+
+// Pointer Lock
+const startBtn = document.getElementById('startBtn');
+const blocker = document.getElementById('blocker');
+startBtn.addEventListener('click', ()=>{
+    renderer.domElement.requestPointerLock();
+});
+document.addEventListener('pointerlockchange', ()=>{
+    const locked = document.pointerLockElement === renderer.domElement;
+    blocker.style.display = locked ? 'none' : 'flex';
+});
+document.addEventListener('mousemove', e=>{
+    if(document.pointerLockElement === renderer.domElement){
+        yaw -= e.movementX*0.002;
+        player.rotation.y = yaw;
+    }
+});
+
+// HUD
+let health=100, maxHealth=100, score=0, wave=1, bulletDamage=1;
+const PLAYER_STARTER_FIRE_RATE = 4; // shots per second (used by secret drone) // default 'starter' rate
+const healthEl=document.getElementById('health'), scoreEl=document.getElementById('score'), waveEl=document.getElementById('wave');
+function updateHUD(){ 
+    healthEl.textContent=Math.max(0,Math.floor(health)); 
+    scoreEl.textContent=score; 
+    waveEl.textContent=wave;
+}
+
+// Bullets
+const bullets=[];
+const bulletSpeed=120;
+document.addEventListener('mousedown', ()=>{
+    if(document.pointerLockElement !== renderer.domElement) return;
+    const b=new THREE.Mesh(new THREE.SphereGeometry(0.12,8,8), new THREE.MeshBasicMaterial({color:0xffff00}));
+    const dir = new THREE.Vector3(0,0,-1).applyAxisAngle(new THREE.Vector3(0,1,0), yaw);
+    b.position.copy(player.position).add(dir.clone());
+    b.userData.velocity = dir.multiplyScalar(bulletSpeed);
+    b.userData.damage = bulletDamage;
+    b.userData.radius = 0.12;
+    bullets.push(b);
+    scene.add(b);
+});
+
+// Enemies
+let enemies=[];
+let corpses=[];
+let drones=[];
+const enemyMat=new THREE.MeshStandardMaterial({color:0xff4444});
+let enemyBaseSpeed = 10;
+let enemyDamage = 10;
+let enemyModelPrefab = null;
+let enemyModelLoaded = false;
+
+function finalizeEnemyModel(obj){
+    obj.traverse(function(n){ if(n.isMesh){ n.castShadow = true; n.receiveShadow = true; }});
+    // Adjust scale/rotation to reasonable values for enemies
+    obj.scale.set(0.025, 0.025, 0.025);
+    obj.rotation.y = Math.PI;
+    obj.rotation.x = Math.PI*90/180;
+
+    // Compute bbox after scaling/rotation and center vertically (so spawning at y=1.5 matches box center)
+    const bbox = new THREE.Box3().setFromObject(obj);
+    const center = bbox.getCenter(new THREE.Vector3());
+    obj.position.y -= center.y;
+
+    // Keep prefab as a Group so we can clone it
+    const g = new THREE.Group(); g.add(obj);
+    const size = bbox.getSize(new THREE.Vector3()); g.userData.height = size.y;
+
+    enemyModelPrefab = g;
+    enemyModelLoaded = true;
+    console.log('Enemy model prefab ready (centered, height=', size.y, ')');
+
+    // Replace any existing box placeholders (spawned earlier) with the model so they don't float
+    for(let i = enemies.length - 1; i >= 0; i--){
+        const e = enemies[i];
+        if(e.geometry && e.geometry.type && e.geometry.type === 'BoxGeometry'){
+            const oldPos = e.position.clone(); const hp = e.userData && e.userData.hp ? e.userData.hp : (e.userData||{}).hp;
+            scene.remove(e); enemies.splice(i,1);
+            const targetHeight = playerModel && playerModel.userData && playerModel.userData.height ? playerModel.userData.height : (enemyModelPrefab.userData && enemyModelPrefab.userData.height ? enemyModelPrefab.userData.height : null);
+            const m = createEnemyFromModel(enemyModelPrefab, new THREE.Vector3(oldPos.x, 0, oldPos.z), hp, targetHeight);
+            scene.add(m); enemies.push(m);
+        }
+    }
+}
+
+function fetchEnemyModel(){
+    const objUrl = encodeURI('Zombie Model/Zombie.obj');
+    const mtlUrl = encodeURI('Zombie Model/obj2.mtl');
+    console.log('Fetching enemy MTL then OBJ via fetch fallback:', mtlUrl, objUrl);
+    fetch(mtlUrl)
+        .then(r => { if(!r.ok) throw new Error('MTL HTTP ' + r.status); return r.text(); })
+        .then(mtlText => {
+            const materialsMap = parseMTL(mtlText);
+            return fetch(objUrl)
+                .then(r => { if(!r.ok) throw new Error('OBJ HTTP ' + r.status); return r.text(); })
+                .then(objText => {
+                    const m = parseOBJ(objText, materialsMap);
+                    if (m) { finalizeEnemyModel(m); console.log('Enemy OBJ parsed via fallback with MTL'); }
+                    else { console.error('Parsed enemy OBJ produced no geometry'); }
+                });
+        })
+        .catch(err => {
+            console.warn('fetch/parse enemy MTL+OBJ failed', err);
+            console.log('Attempting enemy OBJ-only fetch+parse');
+            fetch(objUrl)
+                .then(r => { if(!r.ok) throw new Error('OBJ HTTP ' + r.status); return r.text(); })
+                .then(objText => {
+                    const m = parseOBJ(objText, null);
+                    if (m) { finalizeEnemyModel(m); console.log('Enemy OBJ parsed via fallback (no MTL)'); }
+                    else { console.error('Parsed enemy OBJ produced no geometry'); }
+                })
+                .catch(e => { console.error('fetch/parse enemy failed totally', e); });
+        });
+}
+
+function createEnemyFromModel(sourceMesh, pos, hp, targetHeight){
+    const clone = sourceMesh.clone(true);
+
+    // optionally scale to match target height
+    let bbox = new THREE.Box3().setFromObject(clone);
+    let curH = bbox.getSize(new THREE.Vector3()).y;
+    if(targetHeight && curH > 0){ const s = targetHeight / curH; clone.scale.multiplyScalar(s); }
+
+    // re-compute bbox and center after scaling
+    bbox.setFromObject(clone);
+    const center = bbox.getCenter(new THREE.Vector3());
+    const size = bbox.getSize(new THREE.Vector3());
+    clone.position.y -= center.y;
+
+    const g = new THREE.Group(); g.add(clone);
+    // Place group so the bottom of the model sits at y=0 (ground). If a targetHeight is given, use it; else derive from size
+    const finalHeight = targetHeight && targetHeight > 0 ? targetHeight : size.y;
+    const spawnY = Math.max(0.001, finalHeight/2);
+    g.position.set(pos.x, spawnY, pos.z);
+    const colliderRadius = Math.max(size.x, size.z) / 2;
+    g.userData = { hp: hp, height: finalHeight, colliderRadius: colliderRadius };
+    return g;
+}
+
+function createCorpseFromEnemy(enemy){
+    // Clone visual model, mark non-collidable, and lay it on the ground as a corpse
+    const corpse = enemy.clone(true);
+    corpse.position.copy(enemy.position);
+    // Lay the body flat and randomize orientation a bit
+    corpse.rotation.x += Math.PI/2;
+    corpse.rotation.y += (Math.random()-0.5)*Math.PI*0.5;
+    // Ensure it rests on the ground
+    corpse.position.y = 0.05;
+    corpse.userData = corpse.userData || {};
+    corpse.userData.isCorpse = true;
+    corpse.userData.colliderRadius = 0;
+    corpses.push(corpse);
+    scene.add(corpse);
+    // Remove corpse after 20s to keep scene tidy, store timer so we can cancel if needed
+    const tid = setTimeout(()=>{ const idx = corpses.indexOf(corpse); if(idx!==-1){ corpses.splice(idx,1); scene.remove(corpse); } }, 20000);
+    corpse.userData.corpseTimeout = tid;
+}
+
+function clearCorpses(){
+    for(const c of corpses){
+        try{ if(c && c.userData && c.userData.corpseTimeout) clearTimeout(c.userData.corpseTimeout); }catch(e){}
+        try{ if(c && c.parent) scene.remove(c); }catch(e){}
+    }
+    corpses = [];
+}
+
+// Load the 3D Apache Drone Model
+function loadDroneModel(callback) {
+    // Check if OBJLoader and MTLLoader are available
+    if (typeof OBJLoader === 'undefined' || typeof MTLLoader === 'undefined') {
+        console.error('OBJLoader or MTLLoader is not available!');
+        return;
+    }
+
+    const objLoader = new OBJLoader();
+    const mtlLoader = new MTLLoader();
+
+    // Load MTL (materials) first
+    mtlLoader.load('Drone Model/obj3.mtl', function(materials) {
+        materials.preload();
+        objLoader.setMaterials(materials);
+
+        // Now load the OBJ model
+        objLoader.load('Drone Model/Apache.obj', function(obj) {
+            // Scale and adjust the object to fit your scene
+            obj.scale.set(0.1, 0.1, 0.1); // Adjust scale if needed
+            obj.rotation.y = Math.PI / 2; // Adjust rotation if needed
+            obj.castShadow = true; // Enable shadow for the model
+            obj.receiveShadow = true;
+
+            // Optionally, add further object setup or animations here
+
+            // Call the callback with the loaded object
+            callback(obj);
+        }, 
+        function(xhr) { 
+            if(xhr && xhr.loaded && xhr.total) {
+                console.log('OBJ load progress', (xhr.loaded / xhr.total * 100).toFixed(1) + '%');
+            }
+        }, 
+        function(err) {
+            console.error('Error loading the OBJ model:', err);
+        });
+    }, 
+    function(err) {
+        console.error('Error loading the MTL materials:', err);
+    });
+}
+
+// -- Drone secret feature --------------------------------------------------
+function spawnDroneAt(pos){
+    // Create a container for the drone
+    const drone = new THREE.Group();
+
+    // Load the 3D model and add it to the drone container
+    loadDroneModel(function(droneModel){
+        drone.add(droneModel);
+        const dy = Math.max(1.5, (pos.y || 1.0) + 1.0);
+        drone.position.set(pos.x, dy, pos.z);
+        drone.userData = { lifetimeTimeout: null, shootInterval: null };
+        scene.add(drone); 
+        drones.push(drone);
+
+        // Shooting interval (use player's starter fire rate)
+        const intervalMs = 1000 / PLAYER_STARTER_FIRE_RATE;
+        const iid = setInterval(()=>{ shootAtNearestEnemy(drone); }, intervalMs);
+        drone.userData.shootInterval = iid;
+
+        // Auto-remove after 10s
+        const tid = setTimeout(()=>{ clearDrone(drone); }, 10000);
+        drone.userData.lifetimeTimeout = tid;
+    });
+
+    return drone;
+}
+
+// Function for the drone to shoot at the nearest enemy
+function shootAtNearestEnemy(drone){
+    if(enemies.length === 0) return;
+    let target = null;
+    let minD = Infinity;
+    
+    // Find the nearest enemy
+    for(const e of enemies){
+        const d = drone.position.distanceTo(e.position);
+        if(d < minD){
+            minD = d;
+            target = e;
+        }
+    }
+
+    if(!target) return;
+
+    // Calculate direction to the target and shoot a bullet
+    const dir = target.position.clone().sub(drone.position).normalize();
+    const bullet = new THREE.Mesh(new THREE.SphereGeometry(0.12, 8, 8), new THREE.MeshBasicMaterial({color: 0x00ffff}));
+    bullet.position.copy(drone.position).add(dir.clone().multiplyScalar(0.6));
+    bullet.userData.velocity = dir.multiplyScalar(bulletSpeed);
+    bullet.userData.damage = 10; // Drone bullets do fixed 10 damage
+    bullet.userData.radius = 0.12;
+    bullets.push(bullet); 
+    scene.add(bullet);
+}
+
+// Clear the drone and remove it from the scene
+function clearDrone(drone){
+    try{ if(drone.userData && drone.userData.shootInterval) clearInterval(drone.userData.shootInterval); }catch(e){}
+    try{ if(drone.userData && drone.userData.lifetimeTimeout) clearTimeout(drone.userData.lifetimeTimeout); }catch(e){}
+    const idx = drones.indexOf(drone); 
+    if(idx !== -1) drones.splice(idx,1);
+    try{ if(drone.parent) scene.remove(drone); }catch(e){}
+}
+
+// Clear all drones from the scene
+function clearDrones(){
+    for(const d of drones){ 
+        clearDrone(d); 
+    }
+    drones = [];
+}
+
+
+function spawnEnemy(){ 
+    const angle=Math.random()*Math.PI*2;
+    const dist = MAP_SIZE/2 - 10;
+    const posXZ = new THREE.Vector3(Math.cos(angle)*dist, 0, Math.sin(angle)*dist);
+    const hpVal = 3+Math.floor(Math.random()*3);
+
+    const targetHeight = playerModel && playerModel.userData && playerModel.userData.height ? playerModel.userData.height : (enemyModelPrefab && enemyModelPrefab.userData && enemyModelPrefab.userData.height ? enemyModelPrefab.userData.height : 3);
+
+    if(enemyModelLoaded && enemyModelPrefab){
+        const e = createEnemyFromModel(enemyModelPrefab, posXZ, hpVal, targetHeight);
+        scene.add(e); enemies.push(e);
+    } else if(playerModel){
+        // if enemy prefab is not available but player model is, use player's model's geometry as basis but keep it distinct
+        const e = createEnemyFromModel(playerModel, posXZ, hpVal, playerModel.userData.height);
+        scene.add(e); enemies.push(e);
+    } else {
+        const m=new THREE.Mesh(new THREE.BoxGeometry(2,3,2), enemyMat);
+        // ensure box sits on ground
+        m.position.set(posXZ.x, 3/2, posXZ.z);
+        m.userData.hp = hpVal;        m.userData.colliderRadius = 1.0;        scene.add(m); enemies.push(m);
+    }
+}
+
+// Upgrade menu
+const upgradeMenu = document.getElementById('upgradeMenu');
+const upgradeButtons = [
+    document.getElementById('upgrade1'),
+    document.getElementById('upgrade2'),
+    document.getElementById('upgrade3')
+];
+
+function showUpgradeMenu() {
+    upgradeMenu.style.display = 'block';
+
+    // Release pointer lock so the cursor is visible
+    if (document.pointerLockElement === renderer.domElement) {
+        document.exitPointerLock();
+    }
+
+    const upgrades = [
+        { text: 'Increase Max Health (+20)', action: () => { maxHealth += 20; health += 20; } },
+        { text: 'Increase Bullet Damage (+1)', action: () => { bulletDamage += 1; } },
+        { text: 'Increase Movement Speed (+10%)', action: () => { playerEnemySpeedFactor *= 1.1; } }
+    ];
+
+    function pickUpgrade(index) {
+        upgrades[index].action();
+        upgradeMenu.style.display = 'none';
+        spawnWave();
+
+        // Re-lock pointer after picking
+        renderer.domElement.requestPointerLock();
+
+        // Remove keyboard listener after selection
+        document.removeEventListener('keydown', keyListener);
+    }
+
+    for (let i = 0; i < 3; i++) {
+        upgradeButtons[i].textContent = upgrades[i].text;
+        upgradeButtons[i].onclick = () => pickUpgrade(i);
+    }
+
+    function keyListener(e) {
+        if (e.code === 'Digit1') pickUpgrade(0);
+        if (e.code === 'Digit2') pickUpgrade(1);
+        if (e.code === 'Digit3') pickUpgrade(2);
+    }
+    document.addEventListener('keydown', keyListener);
+}
+
+// Wave system
+function spawnWave(){
+    const count = 5 + wave*2;
+    for(let i=0;i<count;i++) spawnEnemy();
+    health = Math.min(maxHealth, health + 20); 
+    enemyDamage = 10 + (wave-1)*2;  
+}
+
+// Collision helpers and entity collision
+function sphereEnemyCollision(b,e){
+    const br = (b.userData && b.userData.radius) ? b.userData.radius : 0.12;
+    const er = (e.userData && e.userData.colliderRadius) ? e.userData.colliderRadius : 1.0;
+    return b.position.distanceTo(e.position) < (br + er);
+}
+
+// Player collision with buildings (2D sphere approx) + sliding resolution
+let PLAYER_RADIUS = 0.5; // may be overridden when player model loads
+const COLLISION_PADDING = 0.05;
+
+function collidesWithBuildingsAt(pos, radius){
+    for(const b of borderBuildings){
+        const params = b.geometry && b.geometry.parameters ? b.geometry.parameters : {};
+        const hx = (params.width || buildingSize)/2;
+        const hz = (params.depth || buildingSize)/2;
+        const bx = b.position.x; const bz = b.position.z;
+        const nearestX = Math.max(bx - hx, Math.min(pos.x, bx + hx));
+        const nearestZ = Math.max(bz - hz, Math.min(pos.z, bz + hz));
+        const dx = pos.x - nearestX; const dz = pos.z - nearestZ;
+        const dist2 = dx*dx + dz*dz;
+        if(dist2 < (radius + COLLISION_PADDING)*(radius + COLLISION_PADDING)) return true;
+    }
+    return false;
+}
+
+function collidesWithEntitiesAt(pos, radius, self){
+    const EPS = 0.02; // small padding to avoid jitter
+    for(const other of enemies){
+        if(!other) continue;
+        if(other === self) continue;
+        const or = (other.userData && other.userData.colliderRadius) ? other.userData.colliderRadius : 1.0;
+        const d2 = pos.distanceToSquared(other.position);
+        const minD = (radius + or + EPS);
+        if(d2 < minD*minD) return true;
+    }
+    return false;
+}
+
+function resolveEntityMovement(currentPos, moveVec, radius, self){
+    const attempted = currentPos.clone().add(moveVec);
+    const half = MAP_SIZE/2 - 1;
+    attempted.x = Math.max(-half, Math.min(half, attempted.x));
+    attempted.z = Math.max(-half, Math.min(half, attempted.z));
+
+    // check buildings + other entities (only if self provided)
+    const collidesEntities = self ? collidesWithEntitiesAt(attempted, radius, self) : false;
+    if(!collidesWithBuildingsAt(attempted, radius) && !collidesEntities) return attempted;
+
+    // Try X-only slide
+    const attemptX = currentPos.clone().add(new THREE.Vector3(moveVec.x,0,0));
+    attemptX.x = Math.max(-half, Math.min(half, attemptX.x));
+    attemptX.z = currentPos.z;
+    const collidesXEntities = self ? collidesWithEntitiesAt(attemptX, radius, self) : false;
+    if(!collidesWithBuildingsAt(attemptX, radius) && !collidesXEntities) return attemptX;
+
+    // Try Z-only slide
+    const attemptZ = currentPos.clone().add(new THREE.Vector3(0,0,moveVec.z));
+    attemptZ.z = Math.max(-half, Math.min(half, attemptZ.z));
+    attemptZ.x = currentPos.x;
+    const collidesZEntities = self ? collidesWithEntitiesAt(attemptZ, radius, self) : false;
+    if(!collidesWithBuildingsAt(attemptZ, radius) && !collidesZEntities) return attemptZ;
+
+    // Can't move
+    return currentPos.clone();
+}
+
+function resolveMovement(currentPos, moveVec){
+    return resolveEntityMovement(currentPos, moveVec, PLAYER_RADIUS);
+}
+
+// Camera collision
+const raycaster = new THREE.Raycaster();
+const CAMERA_COLLISION_PADDING = 0.4; // how far from walls the camera should stay
+const CAMERA_MIN_DISTANCE = 1.5; // don't allow camera to come closer than this to the player
+function updateCamera(){
+    const offset = new THREE.Vector3(0, camHeight, camDistance).applyAxisAngle(new THREE.Vector3(0,1,0), yaw);
+    const desiredCamPos = player.position.clone().add(offset);
+    const start = player.position.clone().add(new THREE.Vector3(0,1.5,0));
+    const dir = desiredCamPos.clone().sub(start).normalize();
+    const dist = start.distanceTo(desiredCamPos);
+
+    // Cast multiple rays (center, slightly up, left/right offsets) to approximate a sphere cast
+    const up = new THREE.Vector3(0,1,0);
+    const right = new THREE.Vector3(1,0,0).applyAxisAngle(new THREE.Vector3(0,1,0), yaw);
+    const offsets = [
+        new THREE.Vector3(0,0,0),
+        up.clone().multiplyScalar(0.15),
+        right.clone().multiplyScalar(0.25),
+        right.clone().multiplyScalar(-0.25),
+        up.clone().multiplyScalar(0.15).add(right.clone().multiplyScalar(0.25)),
+        up.clone().multiplyScalar(0.15).add(right.clone().multiplyScalar(-0.25))
+    ];
+
+    let minIntersectDist = dist;
+    for(const off of offsets){
+        const s = start.clone().add(off);
+        const target = desiredCamPos.clone().add(off);
+        const dVec = target.clone().sub(s);
+        raycaster.set(s, dVec.clone().normalize());
+        const intersects = raycaster.intersectObjects(borderBuildings, true);
+        if(intersects.length>0 && intersects[0].distance < dVec.length()){
+            minIntersectDist = Math.min(minIntersectDist, intersects[0].distance);
+        }
+    }
+
+    if(minIntersectDist < dist){
+        const camDist = Math.max(CAMERA_MIN_DISTANCE, minIntersectDist - CAMERA_COLLISION_PADDING);
+        camera.position.copy(start.clone().add(dir.clone().multiplyScalar(camDist)));
+    } else {
+        camera.position.copy(desiredCamPos);
+    }
+
+    camera.lookAt(player.position.clone().add(new THREE.Vector3(0,1.0,0)));
+}
+
+// Animate
+let prevTime=performance.now();
+function animate(){
+    requestAnimationFrame(animate);
+    const time=performance.now(), delta=(time-prevTime)/1000;
+    prevTime=time;
+
+    // Movement
+    const forward = new THREE.Vector3(0,0,-1).applyAxisAngle(new THREE.Vector3(0,1,0), yaw);
+    const right = new THREE.Vector3(1,0,0).applyAxisAngle(new THREE.Vector3(0,1,0), yaw);
+    let moveVector = new THREE.Vector3();
+    if(move.forward) moveVector.add(forward);
+    if(move.back) moveVector.add(forward.clone().negate());
+    if(move.left) moveVector.add(right.clone().negate());
+    if(move.right) moveVector.add(right);
+    if(moveVector.lengthSq() > 0){
+        const effectiveMoveSpeed = enemyBaseSpeed * playerEnemySpeedFactor; // player is 10% faster than enemies by default
+        moveVector.normalize().multiplyScalar(effectiveMoveSpeed*delta);
+        const newPos = resolveMovement(player.position, moveVector);
+        player.position.copy(newPos);
+    }
+    player.position.y = 1.0;
+
+    // Camera
+    updateCamera();
+
+    // Bullets
+    for(let i=bullets.length-1;i>=0;i--){
+        const b=bullets[i];
+        b.position.addScaledVector(b.userData.velocity, delta);
+        if(b.position.distanceTo(player.position)>1000){ scene.remove(b); bullets.splice(i,1); continue; }
+        for(let j=enemies.length-1;j>=0;j--){
+            const e=enemies[j];
+            if(sphereEnemyCollision(b,e)){
+                e.userData.hp -= b.userData.damage;
+                scene.remove(b); bullets.splice(i,1);
+                if(e.userData.hp <= 0){
+                    // create a corpse from the enemy model and remove the live enemy
+                    createCorpseFromEnemy(e);
+                    scene.remove(e); enemies.splice(j,1);
+                    score+=10;
+                }
+                break;
+            }
+        }
+    }
+
+    // Enemies
+    for(let e of enemies){
+        const toPlayer = player.position.clone().sub(e.position);
+        toPlayer.y = 0; toPlayer.normalize();
+        const eradius = (e.userData && e.userData.colliderRadius) ? e.userData.colliderRadius : 1.0;
+        const moveVec = toPlayer.multiplyScalar(enemyBaseSpeed*delta);
+        // Pass the enemy as 'self' so entity-entity collision checks can exclude it
+        const newPos = resolveEntityMovement(e.position, moveVec, eradius, e);
+        e.position.copy(newPos);
+        // Make the enemy face the player (keep upright)
+        const dx = player.position.x - e.position.x;
+        const dz = player.position.z - e.position.z;
+        const angle = Math.atan2(dx, dz);
+        e.rotation.y = angle + Math.PI;
+        e.position.x = Math.max(-MAP_SIZE/2 +1, Math.min(MAP_SIZE/2 -1, e.position.x));
+        e.position.z = Math.max(-MAP_SIZE/2 +1, Math.min(MAP_SIZE/2 -1, e.position.z));
+
+        const pradius = (player.userData && player.userData.colliderRadius) ? player.userData.colliderRadius : PLAYER_RADIUS;
+        const dist = e.position.distanceTo(player.position);
+        const attackThresh = eradius + pradius + 0.2;
+        if(dist < attackThresh){ health -= enemyDamage*delta;
+            if(health<=0){ 
+                health=maxHealth; score=Math.max(0,score-20); player.position.set(0,1.0,0); 
+                wave=1; enemies.forEach(en=>scene.remove(en)); enemies=[]; 
+                // Remove existing corpses and drones so the world resets when the player dies
+                clearCorpses();
+                clearDrones();
+                showUpgradeMenu();
+            }
+        }
+    }
+
+    // Next wave
+    if(enemies.length===0 && upgradeMenu.style.display==='none'){ 
+        wave++; 
+        showUpgradeMenu();
+    }
+
+    updateHUD();
+    renderer.render(scene,camera);
+}
+animate();
+
+// Start first wave with upgrade menu
+showUpgradeMenu();
+
+// Error overlay capture: show JS errors and console.error in the overlay for easier debugging
+(function(){
+    const overlay = document.getElementById('errorOverlay');
+    function showMsg(msg){ overlay.style.display='block'; overlay.textContent += msg + '\n\n'; overlay.scrollTop = overlay.scrollHeight; }
+    const oldErr = console.error.bind(console);
+    console.error = function(){ oldErr.apply(console, arguments); try{ showMsg('[console.error] ' + Array.from(arguments).map(a=> (typeof a==='object'? (a.message || JSON.stringify(a)) : a)).join(' ')); }catch(e){} };
+    window.addEventListener('error', function(e){ showMsg('[uncaught] ' + (e && e.message ? e.message : String(e))); });
+    window.addEventListener('unhandledrejection', function(e){ showMsg('[promise rejection] ' + (e && e.reason ? (e.reason.message || JSON.stringify(e.reason)) : String(e))); });
+})();
+
+// Resize
+window.addEventListener('resize', ()=>{
+    camera.aspect=innerWidth/innerHeight; camera.updateProjectionMatrix();
+    renderer.setSize(innerWidth,innerHeight);
+});
+</script>
+</body>
+</html>
